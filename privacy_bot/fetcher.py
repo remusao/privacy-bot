@@ -100,3 +100,11 @@ def fetch_headless(url, max_retry=3, timeout=10):
         return result
     except TimeoutError:
         pass
+    except:
+        pass
+    finally:
+        # Close driver
+        try:
+            driver.quit()
+        except:
+            pass
