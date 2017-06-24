@@ -6,7 +6,7 @@
 Privacy Bot - privacy policies finder.
 
 Usage:
-    find_policies [options] [<url>...]
+    find_policies [options] [<url>...] [--positive=<PATH>  --negative=<PATH>]
 
 Options:
     --tld TLD               Only find policies on domain having this tld.
@@ -15,12 +15,11 @@ Options:
     -l, --limit L           Limit number of URLs checked
     -m, --max_connections M Maximum number of concurrent connections [default: 30]
     -u, --urls U            File containing a list of urls
-    -w, --websearch         Do a websearch in case the heuristic fails
     -h, --help              Show help
 """
 
 from itertools import islice
-from urllib.parse import urljoin, urldefrag
+from urllib.parse import urljoin, urldefrag, urlparse
 import asyncio
 import concurrent.futures
 import json
@@ -40,6 +39,7 @@ from privacy_bot.mining.fetcher import (
     USERAGENT
 )
 from privacy_bot.mining.utils import setup_logging
+from privacy_bot.analysis.classifier import load_dataset, train_classifier
 import privacy_bot.mining.websearch as websearch
 
 
@@ -54,7 +54,7 @@ KEYWORDS = ['privacy', 'datenschutz',
 KEYWORDS_RE = re.compile('|'.join(KEYWORDS), flags=re.IGNORECASE)
 
 
-def extract_urls(html, string, href):
+def extract_urls(html, clf, string, href):
     urls = []
     current_position = 0
     while True:
@@ -62,34 +62,48 @@ def extract_urls(html, string, href):
         if curpos >= 0:
             # Jump over 'href='
             curpos += 5
+            # Can be ' or "
             quote_symbol = html[curpos]
             # Jump over opening quote
             curpos += 1
 
             # Find closing tag
             closing = html.find('>', curpos)
-            assert closing != -1
+
+            # assert closing != -1
+            if closing == -1:
+                # Could be that the html is not well formed, in which case we
+                # cannot recover from this error. Returns the urls found so far.
+                break
+
             has_content = html[closing - 1] != '/'
+
             # ------------------------------
 
-            # Extract href
+            # Extract href value
             href_end = html.find(quote_symbol, curpos, closing)
             if href_end == -1:
                 current_position = closing + 1
                 continue
-            # TODO - should it be `match` instead?
-            url_match = href.search(html, curpos, href_end) != None
+
+            # Search for a match of the patter in the url, with no copy
+            url_match = href.search(html, curpos, href_end) is not None
             if url_match:
                 url = html[curpos:href_end]
                 urls.append(url)
+
             # -------------------------------------------------
 
             # Extract content and try regex on it
             if has_content and not url_match:
                 # Find next opening tag (max: 100)
-                next_opening = html.find('<', closing, closing + 100)
+
+                # Note: this is an approximation, and it would not be an exact
+                # result if the content of the href also contains tags. It will
+                # just stop at the first closing tag found.
+                next_opening = html.find('</', closing, closing + 100)
                 if next_opening != -1:
-                    text_match = string.search(html, closing + 1, next_opening) != None
+                    text_match = string.search(html, closing + 1, next_opening) is not None
                     if text_match:
                         url = html[curpos:href_end]
                         urls.append(url)
@@ -99,10 +113,11 @@ def extract_urls(html, string, href):
             current_position = closing + 1
         else:
             break
+
     return urls
 
 
-def extract_candidates(html, url):
+def extract_candidates(html, url, clf):
     if not html:
         return []
 
@@ -111,11 +126,12 @@ def extract_candidates(html, url):
 
     return list(set(
         urldefrag(urljoin(real_url, href)).url
-        for href in extract_urls(html, string=KEYWORDS_RE, href=KEYWORDS_RE)
+        for href in extract_urls(html, clf=clf, string=KEYWORDS_RE, href=KEYWORDS_RE)
+        if not href.startswith('javascript:')
     ))
 
 
-async def iter_policy_heuristic(session, semaphore, url):
+async def iter_policy_heuristic(session, semaphore, url, clf):
     """Given the URL (usually the homepage) of a domain, extract a list of
     privacy policies url candidates.
     """
@@ -125,6 +141,7 @@ async def iter_policy_heuristic(session, semaphore, url):
     async with semaphore:
         url_exists = await check_if_url_exists(session, url)
         if not url_exists:
+            logging.error('Does not exist: %s', url)
             return []
 
     # Fetch content of the page
@@ -134,21 +151,23 @@ async def iter_policy_heuristic(session, semaphore, url):
     if response and response['text']:
         candidates = extract_candidates(
             html=response['text'],
-            url=response['url']
+            url=response['url'],
+            clf=clf
         )
 
     # Try the headlesss browser if there is no candidates
-    if not candidates:
-        response = await asyncio.get_event_loop().run_in_executor(
-            None,
-            fetch_headless,
-            url
-        )
-        if response:
-            candidates = extract_candidates(
-                html=response['text'],
-                url=response['url']
-            )
+    # if not candidates:
+    #     response = await asyncio.get_event_loop().run_in_executor(
+    #         None,
+    #         fetch_headless,
+    #         url
+    #     )
+    #     if response:
+    #         candidates = extract_candidates(
+    #             html=response['text'],
+    #             url=response['url'],
+    #             clf=clf
+    #         )
 
     if not candidates:
         logging.error('No candidates for %s', url)
@@ -167,15 +186,11 @@ def policy_websearch(base_url):
     return websearch.websearch(query + ' ' + search_terms)
 
 
-async def get_privacy_policy_url(session, semaphore, base_url, websearch=False):
+async def get_privacy_policy_url(session, semaphore, base_url, clf):
     """Given a valid URL, try to locate the privacy statement page. """
     url = 'http://' + base_url
 
-    candidates = await iter_policy_heuristic(session, semaphore, url)
-
-    if not candidates and websearch:
-        # If no candidates were found by the heuristic, do a websearch as fallback.
-        candidates = policy_websearch(base_url)
+    candidates = await iter_policy_heuristic(session, semaphore, url, clf)
 
     return {
         "url": base_url,
@@ -183,7 +198,8 @@ async def get_privacy_policy_url(session, semaphore, base_url, websearch=False):
     }
 
 
-async def get_candidates_policies(loop, urls, websearch, policies_metadata, max_connections):
+async def get_candidates_policies(loop, urls, policies_metadata,
+                                  max_connections, clf):
     print('-' * 80,                             file=sys.stderr)
     print('Initializing Privacy Bot',           file=sys.stderr)
     print('-' * 80,                             file=sys.stderr)
@@ -196,9 +212,18 @@ async def get_candidates_policies(loop, urls, websearch, policies_metadata, max_
     async with aiohttp.ClientSession(loop=loop, connector=connector,
                                      cookie_jar=aiohttp.helpers.DummyCookieJar(),
                                      headers={'User-agent': USERAGENT}) as client:
-        coroutines = [
-            loop.create_task(get_privacy_policy_url(client, semaphore, url, websearch))
+
+        print('Process domains...')
+        domains = {
+            url: tldextract.extract(url)
             for url in urls
+        }
+
+        print('Start gathering policies...')
+        coroutines = [
+            loop.create_task(get_privacy_policy_url(client, semaphore, url, clf))
+            for url in urls
+            if domains[url].domain not in policies_metadata
         ]
 
         for completed in tqdm.tqdm(asyncio.as_completed(coroutines),
@@ -207,10 +232,15 @@ async def get_candidates_policies(loop, urls, websearch, policies_metadata, max_
                                    desc='Gather policies',
                                    unit='domain'):
             result = await completed
+
             candidates = result['candidates']
+            if candidates is None:
+                # Ignore this domain
+                continue
+
             url = result['url']
 
-            ext = tldextract.extract(url)
+            ext = domains[url]
             tld = ext.suffix
             domain = ext.domain
 
@@ -235,7 +265,6 @@ def main():
     setup_logging()
     args = docopt.docopt(__doc__)
 
-    websearch = args['--websearch']
     tld = args['--tld']
     jobs = int(args['--jobs'])
     max_connections = int(args['--max_connections'])
@@ -262,6 +291,14 @@ def main():
            )
     )
 
+    # Train optional URL classifier
+    clf = None
+    if args['--positive'] and args['--negative']:
+        X, clf = load_dataset(args['--positive'],
+                              args['--negative'],
+                              target='url')
+        clf = train_classifier(X=X, clf=clf)
+
     # Limit number of domains to process
     limit = args['--limit']
     if limit:
@@ -276,9 +313,9 @@ def main():
             loop.run_until_complete(get_candidates_policies(
                 loop=loop,
                 urls=urls,
-                websearch=websearch,
                 policies_metadata=policies_metadata,
-                max_connections=max_connections
+                max_connections=max_connections,
+                clf=clf
             ))
 
 

@@ -49,9 +49,9 @@ async def async_fetch(session, url, timeout=10):
     except asyncio.TimeoutError:
         logging.error('Fetch timeout for %s', url)
     except aiohttp.client_exceptions.ClientConnectorError:
-        pass
+        return
     except UnicodeDecodeError:
-        pass
+        return
     except Exception as err:
         logging.exception('Exception while fetching %s (%s)', url, err)
 
