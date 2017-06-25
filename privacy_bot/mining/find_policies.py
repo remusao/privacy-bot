@@ -156,6 +156,10 @@ async def iter_policy_heuristic(session, semaphore, url, clf):
             url=response['url'],
             clf=clf
         )
+        if not candidates:
+            candidates = None
+    else:
+        candidates = []
 
     # Try the headlesss browser if there is no candidates
     # if not candidates:
