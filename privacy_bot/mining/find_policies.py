@@ -12,10 +12,11 @@ Options:
     --tld TLD               Only find policies on domain having this tld.
     --update FILE           Update the given candidates file.
     -j, --jobs J            Maximum number of workers [default: 10]
-    -l, --limit L           Limit number of URLs checked
+    -l, --limit L           Limit number of URLs checked.
     -m, --max_connections M Maximum number of concurrent connections [default: 30]
-    -u, --urls U            File containing a list of urls
-    -h, --help              Show help
+    -u, --urls U            File containing a list of urls.
+    --shuffle               Shuffle urls.
+    -h, --help              Show help.
 """
 
 from itertools import islice
@@ -24,6 +25,7 @@ import asyncio
 import concurrent.futures
 import json
 import logging
+import random
 import sys
 
 import aiohttp
@@ -212,18 +214,11 @@ async def get_candidates_policies(loop, urls, policies_metadata,
     async with aiohttp.ClientSession(loop=loop, connector=connector,
                                      cookie_jar=aiohttp.helpers.DummyCookieJar(),
                                      headers={'User-agent': USERAGENT}) as client:
-
-        print('Process domains...')
-        domains = {
-            url: tldextract.extract(url)
-            for url in urls
-        }
-
         print('Start gathering policies...')
         coroutines = [
             loop.create_task(get_privacy_policy_url(client, semaphore, url, clf))
             for url in urls
-            if domains[url].domain not in policies_metadata
+            if tldextract.extract(url).domain not in policies_metadata
         ]
 
         for completed in tqdm.tqdm(asyncio.as_completed(coroutines),
@@ -239,8 +234,7 @@ async def get_candidates_policies(loop, urls, policies_metadata,
                 continue
 
             url = result['url']
-
-            ext = domains[url]
+            ext = tldextract.extract(url)
             tld = ext.suffix
             domain = ext.domain
 
@@ -254,9 +248,8 @@ async def get_candidates_policies(loop, urls, policies_metadata,
                 "privacy_policies": candidates
             }
 
-        with open('policy_url_candidates.json', 'w') as output:
-            json.dump(policies_metadata, output, sort_keys=True, indent=4)
-
+    with open('policy_url_candidates.json', 'w') as output:
+        json.dump(policies_metadata, output, sort_keys=True, indent=4)
         print('... written to policy_url_candidates.json')
         print('-' * 80, file=sys.stderr)
 
@@ -304,6 +297,9 @@ def main():
     if limit:
         limit = int(limit)
         urls = list(islice(urls, limit))
+
+    if args['--shuffle']:
+        random.shuffle(urls)
 
     # Fetch data
     if urls:
